@@ -253,15 +253,19 @@ configure_login_defs() {
         set_value "$file" PASS_WARN_AGE 7 && set_value "$file" UMASK 027 && echo '[+] login.defs updated.'
 }
 
-remove_nullok() {
+strip_nullok() {
     local file=/etc/pam.d/common-auth
-    ask 'Remove nullok / nullok_secure from active pam_unix authentication lines?' || return
-    backup "$file" || return
     sed -i -E '/^[[:blank:]]*auth[[:blank:]].*pam_unix\.so/ {
         :again
         s/[[:blank:]]+nullok(_secure)?([[:blank:]]|$)/\2/
         t again
-    }' "$file" && echo '[+] Blank-password PAM options removed.'
+    }' "$file"
+}
+
+remove_nullok() {
+    ask 'Remove nullok / nullok_secure from active pam_unix authentication lines?' || return
+    backup /etc/pam.d/common-auth || return
+    strip_nullok && echo '[+] Blank-password PAM options removed.'
 }
 
 enable_syn_cookies() {
@@ -288,13 +292,260 @@ update_packages() {
     apt-get update && apt-get upgrade
 }
 
+# PAM manages login/password rules. Keep its files and bookkeeping together.
+snapshot_pam() {
+    backup /etc/pam.d || return
+    PAM_SAVE=$SAVED
+    PAM_STATE=''
+    if [[ -d /var/lib/pam ]]; then backup /var/lib/pam || return; PAM_STATE=$SAVED; fi
+}
+
+restore_pam() {
+    cp -a -- "$PAM_SAVE/." /etc/pam.d/ || return
+    if [[ -n $PAM_STATE ]]; then cp -a -- "$PAM_STATE/." /var/lib/pam/ || return; fi
+    echo '[!] Previous PAM files were copied back. Keep this terminal open and check a new login.'
+}
+
+password_strength() {
+    local file=/etc/pam.d/common-password config=/etc/security/pwquality.conf pair key value old_config=''
+    echo 'Require 12+ characters when setting a NEW password, including when an administrator sets it.'
+    echo 'Keep this terminal open until you have checked another login.'
+    ask 'Configure password strength? (Installs libpam-pwquality if needed.)' || return
+    snapshot_pam || return
+    if [[ $(dpkg-query -W -f='${Status}' libpam-pwquality 2>/dev/null) != 'install ok installed' ]]; then
+        apt-get install libpam-pwquality || { restore_pam; return; }
+    fi
+    if [[ ! -f /usr/share/pam-configs/pwquality ]]; then echo '[!] Password quality profile is missing.'; return; fi
+    # Let the PAM tool calculate module ordering; never force over custom stacks.
+    if ! DEBIAN_FRONTEND=noninteractive pam-auth-update --enable pwquality; then restore_pam; return; fi
+    if ! awk '
+        /^[ \t]*password[ \t]/ && /pam_pwquality\.so/ {count++; quality=NR; ok=($2=="requisite" || $2=="required")}
+        /^[ \t]*password[ \t]/ && /pam_unix\.so/ {unix=NR; token=($0 ~ /[ \t]use_authtok([ \t]|$)/)}
+        END {exit !(count==1 && ok && quality<unix && token)}' "$file"; then
+        echo '[!] A custom password stack needs your captain. Password policy activation was not confirmed.'
+        restore_pam
+        return
+    fi
+    if [[ -f $config ]]; then backup "$config" || return; old_config=$SAVED; else touch "$config" || return; fi
+    # Preserve a stricter existing minimum and negative credit requirements.
+    local minimum=12 current
+    current=$(awk -F= '/^[ \t]*minlen[ \t]*=/ {gsub(/[ \t]/,"",$2); sub(/#.*/,"",$2); print $2; exit}' "$config")
+    if [[ $current =~ ^[0-9]{1,3}$ ]] && (( 10#$current > minimum )); then minimum=$((10#$current)); fi
+    while IFS= read -r current; do
+        if [[ $current =~ ^[0-9]{1,3}$ ]] && (( 10#$current > minimum )); then minimum=$((10#$current)); fi
+    done < <(awk '/^[ \t]*password[ \t]/ && /pam_pwquality\.so/ {for(i=1;i<=NF;i++) if($i ~ /^minlen=/) {split($i,a,"=");print a[2]}}' "$file")
+    set_value "$config" minlen "$minimum" ' = ' && set_value "$config" enforcing 1 ' = ' || return
+    for key in dcredit ucredit lcredit ocredit; do
+        current=$(awk -F= -v key="$key" '$1 ~ "^[[:blank:]]*"key"[[:blank:]]*$" {gsub(/[ \t]/,"",$2);sub(/#.*/,"",$2);print $2;exit}' "$config")
+        if [[ $current =~ ^\+?[0-9]+$ ]]; then set_value "$config" "$key" 0 ' = ' || return; fi
+    done
+    if awk -v minimum="$minimum" '
+        /^[ \t]*password[ \t]/ && /pam_pwquality\.so/ {
+            line=""
+            for(i=1;i<=NF;i++) {
+                if($i ~ /^(minlen|retry|enforcing)=/ || $i=="enforce_for_root") continue
+                option=$i
+                if(option ~ /^[dulo]credit=\+?[0-9]+$/) {split(option,a,"=");option=a[1]"=0"}
+                line=line (line=="" ? "" : " ") option
+            }
+            print line " retry=3 minlen="minimum" enforcing=1 enforce_for_root";next
+        }
+        {print}' "$file" > "$BACKUP_DIR/password-new" && cat "$BACKUP_DIR/password-new" > "$file" && strip_nullok; then
+        echo "[+] Minimum $minimum characters configured for new passwords; existing passwords were not reset."
+    else
+        restore_pam
+        [[ -z $old_config ]] || cp -a -- "$old_config" "$config"
+    fi
+}
+
+account_lockout() {
+    local file=/etc/pam.d/common-auth config=/etc/security/faillock.conf old_config='' profile
+    local -a profiles=(round1-lockout-before round1-lockout-fail round1-lockout-success)
+    echo 'Five failed logins within 15 minutes will temporarily block an account for 15 minutes.'
+    echo 'Keep this administrator terminal open until you have checked another login.'
+    ask 'Configure temporary account lockout?' || return
+    if [[ -z $(find /usr/lib /lib -name pam_faillock.so -type f -print -quit 2>/dev/null) ]]; then
+        echo '[!] pam_faillock is missing. Ask your captain to check libpam-modules.'; return
+    fi
+    snapshot_pam || return
+    if grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so' "$file"; then
+        if ! grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so.*authfail' "$file" ||
+           ! grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so.*preauth' "$file" ||
+           ! { grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so.*authsucc' "$file" ||
+               grep -Eq '^[[:blank:]]*account[[:blank:]].*pam_faillock\.so' /etc/pam.d/common-account; }; then
+            echo '[!] An incomplete/custom lockout stack needs your captain. Nothing was changed.'; return
+        fi
+    fi
+    if grep -Eq '^[[:blank:]]*(auth|account)[[:blank:]].*pam_faillock\.so.*[[:blank:]]conf=' "$file" /etc/pam.d/common-account; then
+        echo '[!] A separate lockout configuration is in use. Ask your captain to review it.'; return
+    fi
+    if [[ -f $config ]]; then backup "$config" || return; old_config=$SAVED; else touch "$config" || return; fi
+    set_value "$config" deny 5 ' = ' && set_value "$config" fail_interval 900 ' = ' &&
+        set_value "$config" unlock_time 900 ' = ' || return
+    if ! grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so' "$file"; then
+        for profile in "${profiles[@]}"; do
+            if [[ -f /usr/share/pam-configs/$profile ]]; then backup "/usr/share/pam-configs/$profile" || return; fi
+        done
+        cat > /usr/share/pam-configs/round1-lockout-before <<'PAM'
+Name: Round1 temporary lockout check
+Default: no
+Priority: 1024
+Auth-Type: Primary
+Auth:
+        requisite pam_faillock.so preauth silent
+PAM
+        cat > /usr/share/pam-configs/round1-lockout-fail <<'PAM'
+Name: Round1 count failed logins
+Default: no
+Priority: 0
+Auth-Type: Primary
+Auth:
+        [default=die] pam_faillock.so authfail
+PAM
+        cat > /usr/share/pam-configs/round1-lockout-success <<'PAM'
+Name: Round1 clear failures after login
+Default: no
+Priority: 0
+Auth-Type: Additional
+Auth:
+        required pam_faillock.so authsucc
+PAM
+        if ! DEBIAN_FRONTEND=noninteractive pam-auth-update --enable "${profiles[@]}"; then
+            restore_pam; [[ -z $old_config ]] || cp -a -- "$old_config" "$config"; return
+        fi
+    fi
+    if ! grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so.*authfail' "$file" ||
+       ! grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so.*preauth' "$file" ||
+       ! { grep -Eq '^[[:blank:]]*auth[[:blank:]].*pam_faillock\.so.*authsucc' "$file" ||
+           grep -Eq '^[[:blank:]]*account[[:blank:]].*pam_faillock\.so' /etc/pam.d/common-account; }; then
+        echo '[!] Lockout activation was not confirmed. A custom PAM stack needs review.'
+        restore_pam; [[ -z $old_config ]] || cp -a -- "$old_config" "$config"; return
+    fi
+    # Existing inline options override faillock.conf, so align those limits too.
+    for file in /etc/pam.d/common-auth /etc/pam.d/common-account; do
+        sed -i -E '/^[[:blank:]]*(auth|account)[[:blank:]].*pam_faillock\.so/ {
+            s/(^|[[:blank:]])deny=[0-9]+/\1deny=5/g
+            s/(^|[[:blank:]])fail_interval=[0-9]+/\1fail_interval=900/g
+            s/(^|[[:blank:]])unlock_time=[0-9]+/\1unlock_time=900/g
+        }' "$file" || { restore_pam; return; }
+    done
+    strip_nullok || { restore_pam; return; }
+    echo '[+] Temporary lockout configured. Check a fresh successful login before closing this terminal.'
+}
+
+blank_passwords() {
+    local user found=no
+    backup /etc/shadow || return
+    while IFS= read -r user; do
+        found=yes
+        [[ $user =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*\$?$ ]] || continue
+        printf '\n[!] Empty password: %s\n' "$user"
+        if [[ $user == root ]]; then
+            if ask 'Lock the root PASSWORD and continue administering through your normal sudo account?'; then passwd -l root; fi
+        elif ask "Set a password for '$user'?"; then
+            passwd "$user"
+        fi
+    done < <(awk -F: '$2=="" {print $1}' /etc/shadow)
+    [[ $found == yes ]] || echo '[+] No empty local password fields were found.'
+}
+
+manage_groups() {
+    local group names user
+    local -a members=()
+    read -r -p 'Group name from the README (Enter to cancel): ' group || return
+    [[ -n $group ]] || return
+    [[ $group =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*\$?$ ]] || { echo 'Invalid group name.'; return; }
+    case $group in root|sudo|admin) echo 'Use user auditing (option 1) to review administrators.'; return ;; esac
+    backup /etc/group && backup /etc/gshadow || return
+    if ! getent group "$group" >/dev/null; then
+        ask "Create group '$group'?" || return
+        groupadd "$group" || return
+    fi
+    getent group "$group"
+    read -r -p 'Usernames to ADD, separated by spaces (Enter to skip): ' names || return
+    read -r -a members <<< "$names"
+    for user in "${members[@]}"; do
+        if [[ $user =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*\$?$ ]] && getent passwd "$user" >/dev/null; then
+            gpasswd -a "$user" "$group"
+        else echo "Unknown/invalid username: $user"; fi
+    done
+    while IFS= read -r user; do
+        [[ -n $user ]] || continue
+        if ask "Remove '$user' from group '$group'?"; then gpasswd -d "$user" "$group"; fi
+    done < <(getent group "$group" | cut -d: -f4 | tr ',' '\n')
+    echo '[+] Current group:'
+    getent group "$group"
+}
+
+secure_permissions() {
+    local file
+    echo 'Restore standard ownership/permissions for account files and the main sudo configuration.'
+    ask 'Apply these file permissions?' || return
+    for file in /etc/passwd /etc/group /etc/shadow /etc/gshadow; do backup "$file" || return; done
+    chown root:root /etc/passwd /etc/group && chmod 644 /etc/passwd /etc/group || return
+    chown root:shadow /etc/shadow /etc/gshadow && chmod 640 /etc/shadow /etc/gshadow || return
+    if [[ -f /etc/sudoers ]]; then
+        backup /etc/sudoers || return
+        chown root:root /etc/sudoers && chmod 440 /etc/sudoers || return
+        visudo -c || { echo '[!] Sudoers contains an error that needs review.'; return; }
+    fi
+    echo '[+] Account file permissions updated.'
+}
+
+review_activity() {
+    local pid user report="$BACKUP_DIR/listeners-and-scheduled-tasks.txt"
+    {
+        echo '=== Programs accepting network connections ==='
+        ss -lntup
+        echo '=== Full commands for those listening programs ==='
+        while IFS= read -r pid; do ps -p "$pid" -o pid,user,args; done < <(
+            ss -lntup | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -nu)
+        echo '=== System scheduled commands ==='
+        for user in /etc/crontab /etc/cron.d/*; do
+            [[ -f $user ]] || continue
+            printf '\nFile: %s\n' "$user"; cat -- "$user"
+        done
+        echo '=== Per-user scheduled commands ==='
+        while IFS= read -r user; do
+            printf '\nAccount: %s\n' "$user"; crontab -u "$user" -l 2>/dev/null
+        done < <(printf 'root\n'; human_users)
+        echo '=== System timers ==='
+        systemctl list-timers --all --no-pager
+    } | tee "$report"
+    echo "[+] Review saved to: $report"
+    echo 'An unfamiliar program is not automatically malicious. Compare with the README or show your captain.'
+}
+
+review_archives() {
+    local file
+    echo 'Review software archives in user/download locations. Keep authorized files and forensic evidence.'
+    while IFS= read -r -d '' file; do
+        printf '\nArchive: %q\n' "$file"
+        if ask 'Back up and remove this unauthorized archive?'; then backup "$file" && rm -- "$file"; fi
+    done < <(find /home /opt /usr/local /usr/games /tmp -type f \( -iname '*.zip' -o -iname '*.7z' -o -iname '*.rar' -o -iname '*.tgz' -o -iname '*.tar.gz' \) -print0 2>/dev/null)
+}
+
+guided_walkthrough() {
+    local section reply
+    echo 'Each section explains its purpose and asks before changing anything.'
+    echo 'Use the README for decisions about authorized users, groups, services and files.'
+    for section in audit_users password_strength account_lockout blank_passwords manage_groups \
+        configure_login_defs password_ages remove_nullok secure_permissions enable_syn_cookies \
+        audit_services audit_packages configure_ufw configure_ssh configure_apache find_media \
+        review_archives update_packages review_activity; do
+        "$section"
+        read -r -p 'Press Enter for the next section, or type q to stop the walkthrough: ' reply || return
+        [[ ${reply,,} != q ]] || return
+    done
+}
+
 if (( EUID != 0 )); then echo 'Run: sudo bash ~/Downloads/round1.sh'; exit 1; fi
 MAIN_USER=${SUDO_USER:-$(logname 2>/dev/null || echo root)}
 BACKUP_DIR=$(mktemp -d /var/backups/round1-XXXXXXXX) || exit 1
 SAVED=''
-echo 'SIMPLE ROUND ONE HELPER'
 echo 'Run from the VM desktop. Read the current README and finish relevant forensics first.'
 echo "Backups: $BACKUP_DIR"
+echo 'New to Linux? Choose 20 for a guided walkthrough, or choose a section below.'
 while :; do
     cat <<'MENU'
 
@@ -310,6 +561,14 @@ while :; do
 10) Enable IPv4 TCP SYN cookies
 11) Find and review OGG / MP4 / MP3 files in /home
 12) APT update and upgrade
+13) Require stronger NEW passwords (minimum 12 characters)
+14) Temporary lockout after failed logins
+15) Find empty passwords / lock a blank root password
+16) Create groups and review their members
+17) Fix sensitive account-file permissions
+18) Review listening programs and scheduled tasks
+19) Find and review software archives
+20) Guided walkthrough (asks before changes)
  0) Exit
 MENU
     read -r -p 'Choose a number: ' choice || break
@@ -317,6 +576,9 @@ MENU
         1) audit_users ;; 2) audit_services ;; 3) audit_packages ;; 4) configure_ufw ;;
         5) configure_ssh ;; 6) configure_apache ;; 7) password_ages ;; 8) configure_login_defs ;;
         9) remove_nullok ;; 10) enable_syn_cookies ;; 11) find_media ;; 12) update_packages ;;
+        13) password_strength ;; 14) account_lockout ;; 15) blank_passwords ;; 16) manage_groups ;;
+        17) secure_permissions ;; 18) review_activity ;; 19) review_archives ;;
+        20) guided_walkthrough ;;
         0) break ;; *) echo 'Choose a number from the menu.' ;;
     esac
 done
